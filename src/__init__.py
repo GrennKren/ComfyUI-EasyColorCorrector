@@ -1763,6 +1763,88 @@ class EasyColorCorrection:
         use_gpu: bool = True,
         mask: typing.Optional[torch.Tensor] = None,
     ) -> tuple:
+        
+        # Input validation and type conversion for backward compatibility
+        # Handle cases where old workflows pass wrong types due to parameter reordering
+        
+        # Validate and fix float parameters that might receive None or wrong types
+        def safe_float(value, default=0.0, param_name="unknown"):
+            """Convert value to float, handling None, lists, and strings gracefully."""
+            if value is None:
+                print(f"⚠️ Parameter '{param_name}' is None, using default: {default}")
+                return default
+            if isinstance(value, (list, tuple)):
+                print(f"⚠️ Parameter '{param_name}' is a list/tuple, using default: {default}")
+                return default
+            if isinstance(value, str):
+                # Check if it's a preset name that was misplaced
+                if value in self.PRESETS:
+                    print(f"⚠️ Parameter '{param_name}' received preset name '{value}', using default: {default}")
+                    return default
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    print(f"⚠️ Parameter '{param_name}' could not convert '{value}' to float, using default: {default}")
+                    return default
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                print(f"⚠️ Parameter '{param_name}' conversion failed for {type(value).__name__}, using default: {default}")
+                return default
+        
+        # Validate preset parameter
+        if preset is None or preset == '0' or (isinstance(preset, str) and preset not in self.PRESETS):
+            # Use first preset as default if invalid
+            preset = list(self.PRESETS.keys())[0]
+            print(f"⚠️ Invalid preset value, using default: {preset}")
+        
+        # Apply safe_float to all float parameters that might have issues
+        reference_strength = safe_float(reference_strength, 0.3, "reference_strength")
+        white_balance_strength = safe_float(white_balance_strength, 0.0, "white_balance_strength")
+        enhancement_strength = safe_float(enhancement_strength, 0.2, "enhancement_strength")
+        pop_factor = safe_float(pop_factor, 0.7, "pop_factor")
+        effect_strength = safe_float(effect_strength, 0.6, "effect_strength")
+        warmth = safe_float(warmth, 0.0, "warmth")
+        vibrancy = safe_float(vibrancy, 0.0, "vibrancy")
+        contrast = safe_float(contrast, 0.0, "contrast")
+        brightness = safe_float(brightness, 0.0, "brightness")
+        tint = safe_float(tint, 0.0, "tint")
+        variation = safe_float(variation, 0.0, "variation")
+        lift = safe_float(lift, 0.0, "lift")
+        gamma = safe_float(gamma, 0.0, "gamma")
+        gain = safe_float(gain, 0.0, "gain")
+        noise = safe_float(noise, 0.0, "noise")
+        skin_tone_adjustment = safe_float(skin_tone_adjustment, 0.0, "skin_tone_adjustment")
+        sky_adjustment = safe_float(sky_adjustment, 0.0, "sky_adjustment")
+        foliage_adjustment = safe_float(foliage_adjustment, 0.0, "foliage_adjustment")
+        selective_hue_shift = safe_float(selective_hue_shift, 0.0, "selective_hue_shift")
+        selective_saturation = safe_float(selective_saturation, 0.0, "selective_saturation")
+        selective_strength = safe_float(selective_strength, 1.0, "selective_strength")
+        colorize_strength = safe_float(colorize_strength, 0.8, "colorize_strength")
+        skin_warmth = safe_float(skin_warmth, 0.3, "skin_warmth")
+        sky_saturation = safe_float(sky_saturation, 0.6, "sky_saturation")
+        vegetation_green = safe_float(vegetation_green, 0.5, "vegetation_green")
+        sepia_tone = safe_float(sepia_tone, 0.0, "sepia_tone")
+        
+        # Validate boolean parameters
+        if not isinstance(extract_palette, bool):
+            extract_palette = bool(extract_palette) if extract_palette not in [None, [], ""] else False
+        if not isinstance(lock_input_image, bool):
+            lock_input_image = bool(lock_input_image) if lock_input_image not in [None, [], ""] else False
+        if not isinstance(ai_analysis, bool):
+            ai_analysis = bool(ai_analysis) if ai_analysis not in [None, [], ""] else True
+        if not isinstance(adjust_for_skin_tone, bool):
+            adjust_for_skin_tone = bool(adjust_for_skin_tone) if adjust_for_skin_tone not in [None, [], ""] else False
+        if not isinstance(force_colorize, bool):
+            force_colorize = bool(force_colorize) if force_colorize not in [None, [], ""] else False
+        if not isinstance(use_gpu, bool):
+            use_gpu = bool(use_gpu) if use_gpu not in [None, [], ""] else True
+        
+        # Validate colorize_mode
+        valid_colorize_modes = ["deep_learning", "classic", "portrait", "landscape", "vintage"]
+        if colorize_mode not in valid_colorize_modes:
+            colorize_mode = "deep_learning"
+            print(f"⚠️ Invalid colorize_mode, using default: {colorize_mode}")
 
         original_image = image.clone()
         _, height, width, _ = image.shape
