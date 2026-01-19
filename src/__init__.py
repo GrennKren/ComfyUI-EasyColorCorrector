@@ -4634,13 +4634,13 @@ class FilmEmulation:
         shadow_shift = color_shifts["shadows"]
         for i, shift in enumerate(shadow_shift):
             if shift != 0.0:
-                image[..., i] += shift * shadow_mask.unsqueeze(-1)
+                image[..., i] += shift * shadow_mask
         
         # Apply highlight color shifts
         highlight_shift = color_shifts["highlights"]
         for i, shift in enumerate(highlight_shift):
             if shift != 0.0:
-                image[..., i] += shift * highlight_mask.unsqueeze(-1)
+                image[..., i] += shift * highlight_mask
         
         return torch.clamp(image, 0.0, 1.0)
 
