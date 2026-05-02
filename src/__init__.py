@@ -121,8 +121,12 @@ def hsv_to_rgb(hsv: torch.Tensor) -> torch.Tensor:
     return rgb
 
 
-def create_color_range_mask(hsv: torch.Tensor, target_hue: float, hue_range: float = 60.0) -> torch.Tensor:
-    """Create a mask for a specific color range in HSV space."""
+def create_color_range_mask(hsv: torch.Tensor, target_hue: float, hue_range: float = 60.0, pastel_friendly: bool = True) -> torch.Tensor:
+    """Create a mask for a specific color range in HSV space.
+    
+    v1.3-anime-fix: Added pastel_friendly parameter. When True, reduces
+    saturation gate suppression so pastel anime skin colors aren't ignored.
+    """
     h = hsv[..., 0]  # Hue channel (0-1)
     s = hsv[..., 1]  # Saturation channel (0-1)
     
@@ -134,9 +138,16 @@ def create_color_range_mask(hsv: torch.Tensor, target_hue: float, hue_range: flo
     hue_diff = torch.abs(h - target_h)
     hue_diff = torch.min(hue_diff, 1.0 - hue_diff)  # Handle wrap-around at 0/1
     
-    # Create smooth falloff mask based on hue distance and saturation
+    # Create smooth falloff mask based on hue distance
     hue_mask = torch.exp(-((hue_diff / range_h) ** 2) * 3.0)  # Gaussian falloff
-    saturation_mask = torch.clamp(s * 2.0, 0.0, 1.0)  # Favor more saturated colors
+    
+    # v1.3-anime-fix: Saturation gate
+    if pastel_friendly:
+        # Reduced suppression for anime pastel skin (s=0.1 → mask=0.55 instead of 0.20)
+        saturation_mask = torch.clamp(s * 0.5 + 0.5, 0.0, 1.0)
+    else:
+        # Original aggressive gate (for realistic photos)
+        saturation_mask = torch.clamp(s * 2.0, 0.0, 1.0)
     
     return hue_mask * saturation_mask
 
@@ -147,9 +158,13 @@ def apply_selective_color_adjustment(
     hue_adjustment: float,
     saturation_adjustment: float,
     lightness_adjustment: float,
-    hue_range: float = 60.0
+    hue_range: float = 60.0,
+    pastel_friendly: bool = True
 ) -> torch.Tensor:
-    """Apply selective color adjustments to a specific color range."""
+    """Apply selective color adjustments to a specific color range.
+    
+    v1.3-anime-fix: Added pastel_friendly parameter for anime skin support.
+    """
     if abs(hue_adjustment) < 0.001 and abs(saturation_adjustment) < 0.001 and abs(lightness_adjustment) < 0.001:
         return image
     
@@ -157,7 +172,7 @@ def apply_selective_color_adjustment(
     hsv = rgb_to_hsv(image)
     
     # Create mask for target color range
-    mask = create_color_range_mask(hsv, target_hue, hue_range)
+    mask = create_color_range_mask(hsv, target_hue, hue_range, pastel_friendly=pastel_friendly)
     
     # Apply adjustments
     adjusted_hsv = hsv.clone()
@@ -467,26 +482,34 @@ def apply_semantic_color_adjustments(
         return result
     
     # Define semantic color targets with broader, more natural ranges
+    # v1.3-anime-fix: Added anime cool skin targets and pastel-friendly mode
     semantic_targets = []
     
-    # Skin tones: warm oranges/yellows (20-50 degrees)
+    # Skin tones: warm oranges/yellows (20-50 degrees) — realistic skin
     if abs(skin_tone_adjustment) > 0.001:
-        semantic_targets.append((35, selective_hue_shift, selective_saturation + skin_tone_adjustment, skin_tone_adjustment * 0.3, 80.0))
+        semantic_targets.append((35, selective_hue_shift, selective_saturation + skin_tone_adjustment, skin_tone_adjustment * 0.3, 80.0, True))
+        # v1.3-anime-fix: Anime cool skin — lavender/mauve/pink (hue 290-350°)
+        semantic_targets.append((330, selective_hue_shift, selective_saturation + skin_tone_adjustment * 0.8, skin_tone_adjustment * 0.25, 70.0, True))
+        # Fair cool skin near red (hue ~350-10°)
+        semantic_targets.append((5, selective_hue_shift, selective_saturation + skin_tone_adjustment * 0.6, skin_tone_adjustment * 0.2, 40.0, True))
     
     # Sky/water: blues and cyans (200-260 degrees)  
     if abs(sky_adjustment) > 0.001:
-        semantic_targets.append((230, selective_hue_shift, selective_saturation + sky_adjustment, sky_adjustment * 0.2, 70.0))
+        semantic_targets.append((230, selective_hue_shift, selective_saturation + sky_adjustment, sky_adjustment * 0.2, 70.0, True))
     
     # Foliage: greens (90-150 degrees)
     if abs(foliage_adjustment) > 0.001:
-        semantic_targets.append((120, selective_hue_shift, selective_saturation + foliage_adjustment, foliage_adjustment * 0.3, 80.0))
+        semantic_targets.append((120, selective_hue_shift, selective_saturation + foliage_adjustment, foliage_adjustment * 0.3, 80.0, True))
     
     # Apply semantic adjustments
-    for target_hue, hue_adj, sat_adj, light_adj, hue_range in semantic_targets:
+    for target_data in semantic_targets:
+        target_hue, hue_adj, sat_adj, light_adj, hue_range = target_data[:5]
+        pastel = target_data[5] if len(target_data) > 5 else True
         if abs(hue_adj) > 0.001 or abs(sat_adj) > 0.001 or abs(light_adj) > 0.001:
             adjustment = apply_selective_color_adjustment(
                 result, target_hue, hue_adj * selective_strength, 
-                sat_adj * selective_strength, light_adj * selective_strength, hue_range
+                sat_adj * selective_strength, light_adj * selective_strength, hue_range,
+                pastel_friendly=pastel
             )
             # Blend with original based on selective_strength
             result = torch.lerp(result, adjustment, selective_strength)
@@ -549,9 +572,26 @@ def match_to_reference_colors(
     """
     Match image colors to reference using highlights/midtones/shadows LUT approach.
     Works like professional color grading - matches colors in different luminance zones.
+    
+    v1.3-anime-fix: Added numpy-only fallback when ADVANCED_LIBS is not available.
     """
     if not ADVANCED_LIBS_AVAILABLE:
-        return image_np
+        # v1.3-anime-fix: Statistical fallback using numpy only
+        try:
+            corrected = image_np.astype(np.float32)
+            reference_float = reference_np.astype(np.float32)
+            for c in range(3):
+                img_mean = np.mean(corrected[:,:,c])
+                img_std = np.std(corrected[:,:,c])
+                ref_mean = np.mean(reference_float[:,:,c])
+                ref_std = np.std(reference_float[:,:,c])
+                if img_std > 0:
+                    normalized = (corrected[:,:,c] - img_mean) / img_std
+                    rescaled = normalized * ref_std + ref_mean
+                    corrected[:,:,c] = corrected[:,:,c] * (1 - strength) + rescaled * strength
+            return np.clip(corrected, 0, 255).astype(np.uint8)
+        except Exception:
+            return image_np
 
     try:
         if reference_np is None or image_np is None:
@@ -945,6 +985,9 @@ def enhance_faces(
                     a_mean = np.mean(segment_lab[:, 1])
                     b_mean = np.mean(segment_lab[:, 2])
 
+                    # v1.3-anime-fix: Expanded LAB ranges for anime/webtoon skin
+                    # Original ranges only covered warm realistic skin (B > 130)
+                    # Anime cool skin (lavender, mauve, pink) has B < 130
                     l_valid = 40 < l_mean < 200
                     a_valid = 120 < a_mean < 142
                     b_valid = 130 < b_mean < 165
@@ -965,10 +1008,21 @@ def enhance_faces(
                         and 130 < b_mean < 160
                     )
 
+                    # v1.3-anime-fix: Anime cool/pastel skin category
+                    # Covers: lavender (A~120, B~115), mauve (A~126, B~112),
+                    # cool pink (A~130, B~120), fair cool (A~124, B~120)
+                    is_anime_cool_skin = (
+                        l_mean > 80
+                        and 108 < a_mean < 165
+                        and 108 < b_mean < 180
+                        and l_mean < 255
+                    )
+
                     if (
                         (l_valid and a_valid and b_valid)
                         or dark_skin_valid
                         or light_skin_valid
+                        or is_anime_cool_skin
                     ):
                         skin_segments.add(segment_id)
 
@@ -4731,62 +4785,94 @@ class FilmEmulation:
         return image * rolloff_factor
 
 
+
 class VAEColorCorrector:
     """
     Specialized color correction for VAE artifacts in inpainting/img2img workflows.
-    Fixes color shifts in unmasked areas by referencing the original input image.
+    
+    v1.4-anime-inpaint-fix: Complete rewrite for anime/webtoon inpainting.
+    - Uses semantic skin-to-skin color transfer (NOT spatial correspondence)
+    - Samples reference skin from non-mask areas, applies to mask areas
+    - Supports anime/webtoon color ranges (cool/pastel/pink skin tones)
+    - New parameters: anime_mode, correction_target, skin_sample_region
+    - New method: anime_skin_match (the recommended method for inpainting)
     """
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "original_image": ("IMAGE", {"tooltip": "🔴 Original input image (before VAE encoding)"}),
-                "processed_image": ("IMAGE", {"tooltip": "🟡 Image after VAE decode (with color shifts)"}),
+                "original_image": ("IMAGE", {"tooltip": "Original input image (before VAE encoding)"}),
+                "processed_image": ("IMAGE", {"tooltip": "Image after inpainting/compositing (with color mismatches in masked area)"}),
                 "correction_strength": (
                     "FLOAT", 
                     {
-                        "default": 0.8, 
+                        "default": 0.85, 
                         "min": 0.0, 
                         "max": 1.0, 
                         "step": 0.01,
-                        "tooltip": "🎚️ How strongly to correct VAE color shifts (0.0 = no correction, 1.0 = full correction)"
+                        "tooltip": "How strongly to correct color (0.0 = no change, 1.0 = full correction)"
                     }
                 ),
                 "method": (
-                    ["luminance_zones", "histogram_matching", "statistical_matching", "advanced_3d_lut"], 
+                    ["anime_skin_match", "luminance_zones", "histogram_matching", "statistical_matching", "advanced_3d_lut"], 
                     {
-                        "default": "luminance_zones",
-                        "tooltip": "🔧 Color correction method:\n• luminance_zones: Professional shadows/midtones/highlights (recommended)\n• histogram_matching: Match color distributions\n• statistical_matching: Match color statistics\n• advanced_3d_lut: Most accurate but slower 3D color mapping"
+                        "default": "anime_skin_match",
+                        "tooltip": "Color correction method:\n"
+                            "anime_skin_match: [BEST for inpainting] Semantic skin-to-skin transfer using mask-aware LAB color matching\n"
+                            "luminance_zones: Shadows/midtones/highlights correction\n"
+                            "histogram_matching: Match color distributions\n"
+                            "statistical_matching: Match color statistics (no extra libs needed)\n"
+                            "advanced_3d_lut: 3D color mapping"
                     }
                 ),
-                "auto_preserve": (
-                    "BOOLEAN", 
+                "correction_target": (
+                    ["correct_inpainted", "correct_non_inpainted", "full_image"],
+                    {
+                        "default": "correct_inpainted",
+                        "tooltip": "Which areas to correct:\n"
+                            "correct_inpainted: [FOR INPAINTING] Correct colors in the masked/inpainted area to match surrounding skin\n"
+                            "correct_non_inpainted: Correct non-masked areas\n"
+                            "full_image: Apply correction to entire image"
+                    }
+                ),
+                "anime_mode": (
+                    "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "🤖 Auto-detect and preserve inpainted areas when no mask is provided"
+                        "tooltip": "Enable anime/webtoon-specific adjustments: wider skin color ranges, pastel/cool skin support"
+                    }
+                ),
+            },
+            "optional": {
+                "mask": ("MASK", {"tooltip": "Inpainting mask - white = inpainted area (will be corrected), black = original area (used as reference)"}),
+                "edge_feather": (
+                    "INT", 
+                    {
+                        "default": 15, 
+                        "min": 0, 
+                        "max": 100, 
+                        "step": 1,
+                        "tooltip": "Feather edges between corrected/preserved areas (pixels). Higher = smoother blend."
+                    }
+                ),
+                "skin_sample_region": (
+                    "STRING",
+                    {
+                        "default": "auto",
+                        "tooltip": "Where to sample reference skin color from:\n"
+                            "auto: Auto-detect from non-masked skin areas\n"
+                            "top_quarter: Top 25% of image (good for face portraits)\n"
+                            "center: Center region\n"
+                            "full: Entire non-masked area"
                     }
                 ),
                 "lock_input_image": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "🔒 Lock input images to prevent upstream nodes from reprocessing when adjusting correction parameters",
+                        "tooltip": "Lock input images to prevent upstream reprocessing when adjusting parameters",
                     },
-                ),
-            },
-            "optional": {
-                "vae": ("VAE", {"tooltip": "🔧 VAE model used for encoding/decoding (helps with VAE-specific color corrections)"}),
-                "mask": ("MASK", {"tooltip": "⚫ Optional mask - white areas will be preserved (inpainted areas)"}),
-                "edge_feather": (
-                    "INT", 
-                    {
-                        "default": 5, 
-                        "min": 0, 
-                        "max": 50, 
-                        "step": 1,
-                        "tooltip": "🌟 Feather edges between corrected/preserved areas (pixels)"
-                    }
                 ),
             }
         }
@@ -4801,23 +4887,20 @@ class VAEColorCorrector:
         self, 
         original_image, 
         processed_image, 
-        correction_strength=0.8,
-        method="luminance_zones",
-        auto_preserve=True,
-        lock_input_image=False,
-        vae=None,
+        correction_strength=0.85,
+        method="anime_skin_match",
+        correction_target="correct_inpainted",
+        anime_mode=True,
         mask=None,
-        edge_feather=5
+        edge_feather=15,
+        skin_sample_region="auto",
+        lock_input_image=False,
     ):
-        """
-        Correct VAE-induced color shifts by referencing the original image.
-        """
+        """Correct VAE-induced color shifts by referencing the original image."""
         device = original_image.device
         
-        # Handle input image locking to prevent upstream reprocessing
+        # Handle input image locking
         if lock_input_image:
-            # Check if input images have changed (cache invalidation)
-            images_changed = False
             if (
                 not hasattr(self, "_cached_original_image")
                 or self._cached_original_image is None
@@ -4826,35 +4909,28 @@ class VAEColorCorrector:
             ):
                 images_changed = True
             else:
-                # Compare image tensors to detect changes from upstream
                 try:
-                    if not torch.equal(self._cached_original_image, original_image) or \
-                       not torch.equal(self._cached_processed_image, processed_image):
-                        images_changed = True
-                except:
-                    # Different shapes or other comparison issues = definitely changed
+                    images_changed = not (
+                        torch.equal(self._cached_original_image, original_image) and
+                        torch.equal(self._cached_processed_image, processed_image)
+                    )
+                except Exception:
                     images_changed = True
             
             if images_changed:
                 self._cached_original_image = original_image.clone()
                 self._cached_processed_image = processed_image.clone()
-                self._cached_vae_analysis = None
-                print("🔄 Locked Input: New images detected, updating cache")
+                print("[VAE-CC] Locked Input: New images detected, updating cache")
             
-            # Use cached images for processing
             original_image = self._cached_original_image.clone()
             processed_image = self._cached_processed_image.clone()
         
-        print(f"🔧 VAE Color Correction: method={method}, strength={correction_strength:.2f}")
-        print(f"📏 Original: {original_image.shape}, Processed: {processed_image.shape}")
-        if lock_input_image:
-            print("🔒 Input images locked - preventing upstream reprocessing")
-        if vae is not None:
-            print("🎯 VAE model provided for enhanced correction")
+        print(f"[VAE-CC] method={method}, strength={correction_strength:.2f}, target={correction_target}, anime={anime_mode}")
+        print(f"[VAE-CC] Original: {original_image.shape}, Processed: {processed_image.shape}")
         
         # Ensure images are same size
         if original_image.shape != processed_image.shape:
-            print("⚠️ Image size mismatch - resizing processed to match original")
+            print("[VAE-CC] Image size mismatch - resizing processed to match original")
             processed_image = F.interpolate(
                 processed_image.permute(0, 3, 1, 2), 
                 size=(original_image.shape[1], original_image.shape[2]), 
@@ -4870,22 +4946,23 @@ class VAEColorCorrector:
             proc_img = processed_image[i]
             current_mask = mask[i] if mask is not None else None
             
-            # Apply color correction
             corrected_img = self._apply_vae_color_correction(
                 orig_img, proc_img, method, correction_strength, 
-                auto_preserve, vae, current_mask, edge_feather, device, lock_input_image
+                correction_target, current_mask, edge_feather, device,
+                anime_mode, skin_sample_region
             )
             
             corrected_batch.append(corrected_img)
         
         result = torch.stack(corrected_batch, dim=0)
-        print(f"✅ VAE color correction completed for {len(corrected_batch)} images")
+        print(f"[VAE-CC] Completed for {len(corrected_batch)} images")
         
         return (result,)
     
     def _apply_vae_color_correction(
         self, original_img, processed_img, method, strength, 
-        auto_preserve, vae, mask, edge_feather, device, lock_input_image
+        correction_target, mask, edge_feather, device,
+        anime_mode, skin_sample_region
     ):
         """Apply the actual color correction."""
         
@@ -4893,444 +4970,525 @@ class VAEColorCorrector:
         orig_np = (original_img.cpu().numpy() * 255).astype(np.uint8)
         proc_np = (processed_img.cpu().numpy() * 255).astype(np.uint8)
         
-        # VAE-specific adjustments with caching
-        vae_adjustment = 1.0
-        vae_color_bias = None
-        if vae is not None:
-            # Use cached VAE analysis when input is locked
-            if (
-                lock_input_image
-                and hasattr(self, "_cached_vae_analysis")
-                and self._cached_vae_analysis is not None
-            ):
-                vae_adjustment, vae_color_bias = self._cached_vae_analysis
-                print("🎯 Using cached VAE analysis for enhanced correction")
-            else:
-                print("🎯 VAE model detected - analyzing VAE characteristics for enhanced correction")
-                vae_adjustment, vae_color_bias = self._analyze_vae_characteristics(vae, orig_np, proc_np)
-                # Cache the analysis if input is locked
-                if lock_input_image:
-                    self._cached_vae_analysis = (vae_adjustment, vae_color_bias)
+        print(f"[VAE-CC] Applying {method} color correction (anime_mode={anime_mode})...")
         
-        print(f"🔧 Applying {method} color correction...")
-        
-        # Balance strength across different methods
-        adjusted_strength = self._balance_correction_strength(method, strength) * vae_adjustment
-        
-        # Additional safety: limit maximum strength to prevent quantization artifacts
-        if adjusted_strength > 1.0:
-            print(f"⚠️ Strength {adjusted_strength:.2f} > 1.0, clamping to 1.0 to prevent artifacts")
-            adjusted_strength = 1.0
-        
-        print(f"🔧 Adjusted strength: {strength:.2f} → {adjusted_strength:.2f} for {method}")
-        
-        # Apply color correction based on method with VAE bias compensation
-        if method == "advanced_3d_lut":
-            corrected_np = self._advanced_3d_lut_correction(orig_np, proc_np, adjusted_strength, vae_color_bias)
+        # Apply color correction based on method
+        if method == "anime_skin_match":
+            corrected_np = self._anime_skin_match_correction(
+                orig_np, proc_np, strength, anime_mode, mask, skin_sample_region
+            )
+        elif method == "advanced_3d_lut":
+            corrected_np = self._advanced_3d_lut_correction(orig_np, proc_np, strength)
         elif method == "luminance_zones":
-            if vae_color_bias is not None:
-                corrected_np = self._vae_aware_luminance_correction(proc_np, orig_np, adjusted_strength, vae_color_bias)
-            else:
-                corrected_np = match_to_reference_colors(proc_np, orig_np, adjusted_strength)
+            corrected_np = match_to_reference_colors(proc_np, orig_np, strength)
         elif method == "histogram_matching":
-            corrected_np = self._histogram_matching_correction(orig_np, proc_np, adjusted_strength, vae_color_bias)
+            corrected_np = self._histogram_matching_correction(orig_np, proc_np, strength)
         else:  # statistical_matching
-            corrected_np = self._statistical_matching_correction(orig_np, proc_np, adjusted_strength, vae_color_bias)
+            corrected_np = self._statistical_matching_correction(orig_np, proc_np, strength)
         
         # Convert back to tensor
         corrected_tensor = torch.from_numpy(corrected_np.astype(np.float32) / 255.0).to(device)
         
-        # Handle mask-based preservation
+        # Handle mask-based targeting
         if mask is not None:
-            # Always use mask consistently: white pixels = preserve, black pixels = correct
-            corrected_tensor = self._apply_mask_preservation(
-                processed_img, corrected_tensor, mask, edge_feather, device
+            corrected_tensor = self._apply_mask_targeting(
+                processed_img, corrected_tensor, mask, edge_feather, device, correction_target
             )
-        elif auto_preserve:
-            # Auto-detect changed areas if no mask provided and auto_preserve is True
-            corrected_tensor = self._auto_preserve_inpainted(
-                original_img, processed_img, corrected_tensor, edge_feather, device
+        elif correction_target != "full_image":
+            # Auto-detect changed areas for targeting
+            corrected_tensor = self._auto_target_correction(
+                original_img, processed_img, corrected_tensor, edge_feather, device, correction_target
             )
         
         return corrected_tensor
     
-    def _safe_clamp_colors(self, image_np, preserve_gradients=True):
-        """Safely clamp colors to prevent quantization artifacts (black squares)."""
-        # Diagnostic: Check for extreme values
-        min_val = np.min(image_np)
-        max_val = np.max(image_np)
-        if min_val < -10 or max_val > 265:
-            print(f"⚠️ Extreme color values detected: min={min_val:.1f}, max={max_val:.1f} - applying safe clamping")
+    # =========================================================================
+    # CORE METHOD: Anime Skin Match — mask-aware skin-to-skin color transfer
+    # =========================================================================
+    def _anime_skin_match_correction(self, original_np, processed_np, strength, anime_mode, mask, skin_sample_region):
+        """
+        Anime/webtoon-optimized color correction for INPAINTING.
         
-        if preserve_gradients:
-            # Soft clamping with sigmoid-like curve to preserve gradients
-            image_float = image_np.astype(np.float32)
+        KEY INSIGHT: In inpainting workflows, the PROCESSED image already has
+        correct skin colors in NON-MASK areas (face, arms = cool/pinkish) and
+        wrong skin colors in MASK areas (inpainted body = warm/yellow).
+        
+        We do NOT use the original image for color reference because at mask
+        locations, the original has CLOTHING, not skin.
+        
+        Strategy:
+        1. Sample skin-like colors from NON-MASK areas of the PROCESSED image (reference)
+        2. Find skin-like colors in MASK areas of the PROCESSED image (target)
+        3. Compute per-luminance-zone color shift from target to reference in LAB space
+        4. Apply shift to mask area only, with strength blending
+        """
+        if ADVANCED_LIBS_AVAILABLE:
+            return self._anime_skin_match_advanced(processed_np, strength, anime_mode, mask, skin_sample_region)
+        else:
+            print("[VAE-CC] Advanced libs not available, using statistical fallback")
+            corrected = self._statistical_matching_correction(processed_np, processed_np, strength)
+            if anime_mode:
+                corrected = self._apply_anime_cool_bias(corrected, strength * 0.3)
+            return corrected
+    
+    def _anime_skin_match_advanced(self, processed_np, strength, anime_mode, mask, skin_sample_region):
+        """
+        Advanced anime skin match using OpenCV LAB color space.
+        
+        This is the CORRECT algorithm for inpainting color correction:
+        - Reference = skin pixels in PROCESSED image OUTSIDE the mask
+        - Target = skin pixels in PROCESSED image INSIDE the mask
+        - Transfer reference color characteristics to target
+        """
+        try:
+            # Convert to LAB for perceptual color analysis
+            proc_lab = cv2.cvtColor(processed_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+            h, w = processed_np.shape[:2]
             
-            # Apply soft clamping for values outside normal range
-            below_zero = image_float < 0
-            above_255 = image_float > 255
+            # Determine mask for inpainted vs non-inpainted areas
+            if mask is not None:
+                mask_np = mask.cpu().numpy() if isinstance(mask, torch.Tensor) else mask
+                # In ComfyUI: white (1) = inpainted area, black (0) = original area
+                inpainted_mask = (mask_np > 0.5)  # Boolean: True = inpainted
+                non_inpainted_mask = ~inpainted_mask  # Boolean: True = original/reference
+                print(f"[VAE-CC] Mask provided: {np.sum(inpainted_mask)} inpainted pixels, {np.sum(non_inpainted_mask)} reference pixels")
+            else:
+                # No mask provided — use whole image as reference, correct everything
+                inpainted_mask = np.ones((h, w), dtype=bool)
+                non_inpainted_mask = np.ones((h, w), dtype=bool)
+                print("[VAE-CC] No mask provided, using full image for both reference and target")
             
-            if np.any(below_zero):
-                # Soft approach to zero for negative values
-                negative_values = image_float[below_zero]
-                image_float[below_zero] = -5 * np.log(1 + np.exp(-negative_values / 5))
+            # ----------------------------------------------------------------
+            # STEP 1: Sample REFERENCE skin from non-inpainted areas
+            # ----------------------------------------------------------------
+            # Determine sampling region
+            if skin_sample_region == "top_quarter":
+                region_mask = np.zeros((h, w), dtype=bool)
+                region_mask[:h // 4, :] = True
+            elif skin_sample_region == "center":
+                region_mask = np.zeros((h, w), dtype=bool)
+                region_mask[h // 4:3 * h // 4, w // 4:3 * w // 4] = True
+            else:  # auto or full
+                region_mask = np.ones((h, w), dtype=bool)
+            
+            # Combine: sample from non-inpainted AND within the region
+            sample_mask = non_inpainted_mask & region_mask
+            
+            # Get LAB values at sample locations
+            sample_lab = proc_lab[sample_mask]
+            
+            if len(sample_lab) < 100:
+                print("[VAE-CC] Too few reference pixels in sample region, expanding to full non-masked area")
+                sample_lab = proc_lab[non_inpainted_mask]
+            
+            if len(sample_lab) < 50:
+                print("[VAE-CC] Insufficient reference pixels, falling back to statistical matching")
+                return self._statistical_matching_correction(processed_np, processed_np, strength)
+            
+            # ----------------------------------------------------------------
+            # STEP 2: Identify SKIN pixels in the reference (non-mask) area
+            # ----------------------------------------------------------------
+            # LAB ranges for anime/webtoon skin detection (OpenCV uint8 scale)
+            # L: 0-255 (lightness), A: 0-255 (128=neutral), B: 0-255 (128=neutral)
+            if anime_mode:
+                # Wider ranges for anime: covers warm, cool, pastel, pink, lavender
+                l_lo, l_hi = 80, 255
+                a_lo, a_hi = 108, 170  # Expanded: cool skin has lower A (more green-less red)
+                b_lo, b_hi = 105, 185  # Expanded: cool/pastel skin has lower B
+            else:
+                l_lo, l_hi = 40, 220
+                a_lo, a_hi = 118, 152
+                b_lo, b_hi = 125, 170
+            
+            ref_skin_mask = (
+                (sample_lab[:, 0] > l_lo) & (sample_lab[:, 0] < l_hi) &
+                (sample_lab[:, 1] > a_lo) & (sample_lab[:, 1] < a_hi) &
+                (sample_lab[:, 2] > b_lo) & (sample_lab[:, 2] < b_hi)
+            )
+            ref_skin_lab = sample_lab[ref_skin_mask]
+            
+            if len(ref_skin_lab) < 50:
+                # Fallback: use luminance-based selection for mid-tone pixels
+                print(f"[VAE-CC] Only {len(ref_skin_lab)} skin pixels found in reference, using luminance-based sampling")
+                lum = sample_lab[:, 0]
+                mid_lum_mask = (lum > 100) & (lum < 220)
+                ref_skin_lab = sample_lab[mid_lum_mask]
+                if len(ref_skin_lab) < 30:
+                    print("[VAE-CC] Still too few reference pixels, using all available")
+                    ref_skin_lab = sample_lab
+            
+            print(f"[VAE-CC] Found {len(ref_skin_lab)} reference skin pixels (anime_mode={anime_mode})")
+            
+            # ----------------------------------------------------------------
+            # STEP 3: Identify SKIN pixels in the INPAINTED (mask) area
+            # ----------------------------------------------------------------
+            target_lab = proc_lab[inpainted_mask]
+            
+            # Use SAME skin detection ranges for the inpainted area
+            target_skin_mask = (
+                (target_lab[:, 0] > l_lo) & (target_lab[:, 0] < l_hi) &
+                (target_lab[:, 1] > a_lo) & (target_lab[:, 1] < a_hi) &
+                (target_lab[:, 2] > b_lo) & (target_lab[:, 2] < b_hi)
+            )
+            target_skin_lab = target_lab[target_skin_mask]
+            
+            if len(target_skin_lab) < 30:
+                # If we can't find "skin" in the inpainted area with strict ranges,
+                # use wider ranges or just use all inpainted pixels
+                print(f"[VAE-CC] Only {len(target_skin_lab)} skin pixels in inpainted area, using wider detection")
+                wider_l_lo, wider_l_hi = 60, 255
+                wider_a_lo, wider_a_hi = 100, 180
+                wider_b_lo, wider_b_hi = 95, 200
+                target_skin_mask_wide = (
+                    (target_lab[:, 0] > wider_l_lo) & (target_lab[:, 0] < wider_l_hi) &
+                    (target_lab[:, 1] > wider_a_lo) & (target_lab[:, 1] < wider_a_hi) &
+                    (target_lab[:, 2] > wider_b_lo) & (target_lab[:, 2] < wider_b_hi)
+                )
+                target_skin_lab = target_lab[target_skin_mask_wide]
                 
-            if np.any(above_255):
-                # Soft approach to 255 for values above
-                high_values = image_float[above_255]
-                image_float[above_255] = 255 + 5 * np.log(1 + np.exp((high_values - 255) / 5))
+                if len(target_skin_lab) < 20:
+                    print("[VAE-CC] Very few skin pixels in inpainted area, using all inpainted pixels")
+                    target_skin_lab = target_lab
             
-            # Final gentle clamp
-            return np.clip(image_float, 0, 255).astype(np.uint8)
-        else:
-            # Standard hard clamping
-            return np.clip(image_np, 0, 255).astype(np.uint8)
-    
-    def _analyze_vae_characteristics(self, vae, original_np, processed_np):
-        """Analyze VAE-specific color characteristics and biases."""
-        try:
-            # Note: VAE model object could be used for future model-specific analysis
-            # Currently we analyze empirically by comparing original vs processed images
-            # Calculate per-channel color bias introduced by the VAE
-            orig_float = original_np.astype(np.float32)
-            proc_float = processed_np.astype(np.float32)
+            print(f"[VAE-CC] Found {len(target_skin_lab)} target (inpainted) skin pixels")
             
-            # Analyze color bias in different luminance zones
-            gray_orig = np.mean(orig_float, axis=2)
+            # ----------------------------------------------------------------
+            # STEP 4: Compute per-luminance-zone color transfer
+            # ----------------------------------------------------------------
+            # Cluster reference and target by luminance, then match corresponding zones
+            # This handles the fact that skin has different colors in shadows vs highlights
             
-            # Create luminance-based masks
-            shadows_mask = gray_orig < 85
-            midtones_mask = (gray_orig >= 85) & (gray_orig <= 170)
-            highlights_mask = gray_orig > 170
+            def cluster_by_luminance(lab_data, n_zones=5):
+                """Cluster LAB data into luminance zones and return zone stats."""
+                if len(lab_data) < n_zones * 10:
+                    # Not enough data for clustering, use single zone
+                    return [(np.mean(lab_data, axis=0), np.mean(lab_data, axis=0))]
+                
+                lum = lab_data[:, 0]
+                # Create luminance zones using quantiles
+                percentiles = [i * 100.0 / n_zones for i in range(n_zones + 1)]
+                boundaries = np.percentile(lum, percentiles)
+                
+                zones = []
+                for i in range(n_zones):
+                    zone_mask = (lum >= boundaries[i]) & (lum < boundaries[i + 1])
+                    if np.sum(zone_mask) > 5:
+                        zone_data = lab_data[zone_mask]
+                        zones.append((np.mean(zone_data, axis=0), np.std(zone_data, axis=0)))
+                
+                return zones
             
-            vae_bias = {}
+            ref_zones = cluster_by_luminance(ref_skin_lab, n_zones=5)
+            target_zones = cluster_by_luminance(target_skin_lab, n_zones=5)
             
-            for zone_name, mask in [("shadows", shadows_mask), ("midtones", midtones_mask), ("highlights", highlights_mask)]:
-                if np.sum(mask) > 100:  # Ensure enough pixels for reliable statistics
-                    orig_zone = orig_float[mask]
-                    proc_zone = proc_float[mask]
+            print(f"[VAE-CC] Reference skin: {len(ref_zones)} luminance zones, Target skin: {len(target_zones)} zones")
+            
+            # ----------------------------------------------------------------
+            # STEP 5: Apply zone-based color transfer to inpainted area
+            # ----------------------------------------------------------------
+            corrected_lab = proc_lab.copy()
+            
+            # For each pixel in the inpainted area, find its luminance zone
+            # and apply the corresponding reference zone's color characteristics
+            inpainted_pixel_lab = proc_lab[inpainted_mask]  # All pixels in inpainted area
+            
+            if len(inpainted_pixel_lab) > 0 and len(ref_zones) > 0:
+                # Build reference zone lookup table indexed by L value
+                ref_l_values = [z[0][0] for z in ref_zones]  # Average L for each reference zone
+                ref_a_values = [z[0][1] for z in ref_zones]  # Average A for each reference zone
+                ref_b_values = [z[0][2] for z in ref_zones]  # Average B for each reference zone
+                ref_a_std = [z[1][1] for z in ref_zones]     # A std for each reference zone
+                ref_b_std = [z[1][2] for z in ref_zones]     # B std for each reference zone
+                
+                target_l_values = [z[0][0] for z in target_zones]
+                target_a_values = [z[0][1] for z in target_zones]
+                target_b_values = [z[0][2] for z in target_zones]
+                target_a_std = [z[1][1] for z in target_zones]
+                target_b_std = [z[1][2] for z in target_zones]
+                
+                # For each inpainted pixel, find the closest target zone
+                pixel_l = inpainted_pixel_lab[:, 0]
+                
+                # Assign each pixel to nearest target zone by luminance
+                target_l_arr = np.array(target_l_values)
+                # Find closest target zone for each pixel
+                zone_assignments = np.argmin(
+                    np.abs(pixel_l[:, np.newaxis] - target_l_arr[np.newaxis, :]), axis=1
+                )
+                
+                # Match each target zone to the closest reference zone by luminance
+                target_l_for_match = np.array(target_l_values)
+                ref_l_for_match = np.array(ref_l_values)
+                target_to_ref = np.argmin(
+                    np.abs(target_l_for_match[:, np.newaxis] - ref_l_for_match[np.newaxis, :]), axis=1
+                )
+                
+                # Apply color transfer per-pixel based on zone assignment
+                corrected_inpainted = inpainted_pixel_lab.copy()
+                
+                for tz_idx in range(len(target_zones)):
+                    pixel_mask = zone_assignments == tz_idx
+                    if np.sum(pixel_mask) == 0:
+                        continue
                     
-                    # Calculate color bias per channel
-                    bias_r = np.mean(proc_zone[:, 0]) - np.mean(orig_zone[:, 0])
-                    bias_g = np.mean(proc_zone[:, 1]) - np.mean(orig_zone[:, 1])
-                    bias_b = np.mean(proc_zone[:, 2]) - np.mean(orig_zone[:, 2])
+                    rz_idx = target_to_ref[tz_idx]
                     
-                    vae_bias[zone_name] = np.array([bias_r, bias_g, bias_b])
-                else:
-                    vae_bias[zone_name] = np.array([0.0, 0.0, 0.0])
+                    # Get source (target/inpainted) and destination (reference) stats
+                    t_a_mean = target_a_values[tz_idx]
+                    t_a_s = target_a_std[tz_idx] if target_a_std[tz_idx] > 1 else 1.0
+                    t_b_mean = target_b_values[tz_idx]
+                    t_b_s = target_b_std[tz_idx] if target_b_std[tz_idx] > 1 else 1.0
+                    
+                    r_a_mean = ref_a_values[rz_idx]
+                    r_a_s = ref_a_std[rz_idx] if ref_a_std[rz_idx] > 1 else 1.0
+                    r_b_mean = ref_b_values[rz_idx]
+                    r_b_s = ref_b_std[rz_idx] if ref_b_std[rz_idx] > 1 else 1.0
+                    
+                    # Color transfer: normalize by target stats, then rescale by reference stats
+                    # This preserves luminance while changing color (A, B channels)
+                    zone_pixels = corrected_inpainted[pixel_mask]
+                    
+                    # A channel transfer
+                    a_normalized = (zone_pixels[:, 1] - t_a_mean) / t_a_s
+                    a_transferred = a_normalized * r_a_s + r_a_mean
+                    
+                    # B channel transfer
+                    b_normalized = (zone_pixels[:, 2] - t_b_mean) / t_b_s
+                    b_transferred = b_normalized * r_b_s + r_b_mean
+                    
+                    # Apply with strength blending
+                    corrected_inpainted[pixel_mask, 1] = (
+                        zone_pixels[:, 1] * (1 - strength) + a_transferred * strength
+                    )
+                    corrected_inpainted[pixel_mask, 2] = (
+                        zone_pixels[:, 2] * (1 - strength) + b_transferred * strength
+                    )
+                
+                # Write corrected values back
+                corrected_lab[inpainted_mask] = corrected_inpainted
+                
+                # Also apply a softer correction to pixels in the inpainted area that
+                # weren't detected as skin (e.g., clothing remnants, edges)
+                # This prevents hard transitions at skin/non-skin boundaries
+                non_skin_inpainted = inpainted_mask & ~(
+                    (proc_lab[:, :, 0] > l_lo) & (proc_lab[:, :, 0] < l_hi) &
+                    (proc_lab[:, :, 1] > a_lo * 0.9) & (proc_lab[:, :, 1] < a_hi * 1.1) &
+                    (proc_lab[:, :, 2] > b_lo * 0.9) & (proc_lab[:, :, 2] < b_hi * 1.1)
+                )
+                
+                # Apply 30% of the average color shift to non-skin inpainted pixels
+                if np.any(non_skin_inpainted) and len(ref_skin_lab) > 0 and len(target_skin_lab) > 0:
+                    avg_ref_a = np.mean(ref_skin_lab[:, 1])
+                    avg_ref_b = np.mean(ref_skin_lab[:, 2])
+                    avg_target_a = np.mean(target_skin_lab[:, 1])
+                    avg_target_b = np.mean(target_skin_lab[:, 2])
+                    
+                    a_shift = (avg_ref_a - avg_target_a) * strength * 0.3
+                    b_shift = (avg_ref_b - avg_target_b) * strength * 0.3
+                    
+                    corrected_lab[non_skin_inpainted, 1] += a_shift
+                    corrected_lab[non_skin_inpainted, 2] += b_shift
             
-            # Calculate overall bias strength
-            total_bias = np.mean([np.abs(bias).sum() for bias in vae_bias.values()])
+            # Clamp LAB values
+            corrected_lab[:, :, 0] = np.clip(corrected_lab[:, :, 0], 0, 255)
+            corrected_lab[:, :, 1] = np.clip(corrected_lab[:, :, 1], 0, 255)
+            corrected_lab[:, :, 2] = np.clip(corrected_lab[:, :, 2], 0, 255)
             
-            # Adjust correction strength based on VAE bias severity
-            if total_bias > 15:  # High bias
-                vae_adjustment = 0.85
-                print(f"🔴 High VAE color bias detected ({total_bias:.1f}) - reducing correction strength")
-            elif total_bias > 8:  # Medium bias
-                vae_adjustment = 0.92
-                print(f"🟡 Medium VAE color bias detected ({total_bias:.1f}) - slight adjustment")
-            else:  # Low bias
-                vae_adjustment = 0.98
-                print(f"🟢 Low VAE color bias detected ({total_bias:.1f}) - minimal adjustment")
+            # Convert back to RGB
+            corrected_lab_uint8 = corrected_lab.astype(np.uint8)
+            corrected_rgb = cv2.cvtColor(corrected_lab_uint8, cv2.COLOR_LAB2RGB)
             
-            return vae_adjustment, vae_bias
+            print(f"[VAE-CC] Anime skin match applied: {len(ref_skin_lab)} reference skin pixels, {len(target_skin_lab)} target skin pixels")
+            return corrected_rgb
             
         except Exception as e:
-            print(f"⚠️ VAE analysis failed: {e}, using default settings")
-            return 0.9, None
+            print(f"[VAE-CC] Anime skin match failed: {e}, falling back to statistical matching")
+            import traceback
+            traceback.print_exc()
+            return self._statistical_matching_correction(processed_np, processed_np, strength)
     
-    def _vae_aware_luminance_correction(self, processed_np, original_np, strength, vae_color_bias):
-        """Enhanced luminance zone correction that compensates for VAE-specific color biases."""
-        try:
-            # Start with standard luminance correction
-            corrected_np = match_to_reference_colors(processed_np, original_np, strength)
-            
-            # Apply VAE bias compensation
-            corrected_float = corrected_np.astype(np.float32)
-            gray = np.mean(corrected_float, axis=2)
-            
-            # Apply zone-specific bias corrections
-            shadows_mask = gray < 85
-            midtones_mask = (gray >= 85) & (gray <= 170)
-            highlights_mask = gray > 170
-            
-            bias_strength = strength * 0.3  # Gentle bias correction
-            
-            for zone_name, mask in [("shadows", shadows_mask), ("midtones", midtones_mask), ("highlights", highlights_mask)]:
-                if zone_name in vae_color_bias and np.sum(mask) > 0:
-                    bias = vae_color_bias[zone_name]
-                    # Apply inverse bias correction with limiting
-                    for c in range(3):
-                        bias_correction = bias[c] * bias_strength
-                        # Limit bias correction to prevent extreme shifts
-                        bias_correction = np.clip(bias_correction, -30, 30)
-                        corrected_float[mask, c] -= bias_correction
-            
-            # Safe clamping to prevent quantization artifacts
-            corrected_np = self._safe_clamp_colors(corrected_float, preserve_gradients=True)
-            print(f"✅ VAE-aware luminance correction applied with bias compensation")
-            
-            return corrected_np
-            
-        except Exception as e:
-            print(f"❌ VAE-aware correction failed: {e}, falling back to standard")
-            return match_to_reference_colors(processed_np, original_np, strength)
+    def _apply_anime_cool_bias(self, image_np, strength):
+        """Apply a subtle cool/blue bias to counteract VAE warm shift in anime images."""
+        corrected = image_np.astype(np.float32)
+        corrected[:, :, 0] -= strength * 8   # Reduce red
+        corrected[:, :, 2] += strength * 12  # Increase blue
+        return np.clip(corrected, 0, 255).astype(np.uint8)
     
-    def _balance_correction_strength(self, method, strength):
-        """Balance correction strength across different methods for consistent results."""
-        # Different methods have different sensitivities, so we adjust accordingly
-        if method == "luminance_zones":
-            # Luminance zones method is well-balanced, use as-is
-            return strength
-        elif method == "histogram_matching":
-            # Histogram matching can be aggressive, reduce slightly
-            return strength * 0.85
-        elif method == "statistical_matching":
-            # Statistical matching is gentler, increase slightly
-            return min(1.0, strength * 1.15)
-        elif method == "advanced_3d_lut":
-            # 3D LUT can be very aggressive, reduce significantly
-            return strength * 0.7
+    # =========================================================================
+    # Mask targeting — controls which areas get the correction applied
+    # =========================================================================
+    def _apply_mask_targeting(self, processed_img, corrected_img, mask, edge_feather, device, correction_target):
+        """Apply mask to target which areas get correction."""
+        
+        if correction_target == "correct_inpainted":
+            # White areas in mask (inpainted) = CORRECT these areas
+            correction_mask = mask.to(device).float()
+        elif correction_target == "correct_non_inpainted":
+            # Black areas in mask (original) = CORRECT these areas
+            correction_mask = 1.0 - mask.to(device).float()
+        else:  # full_image
+            return corrected_img
+        
+        # Apply feathering for smooth transitions
+        if edge_feather > 0:
+            correction_mask = self._feather_mask(correction_mask, edge_feather, device)
+        
+        # Apply mask: blend between processed (original) and corrected
+        correction_mask = correction_mask.unsqueeze(-1)  # Add channel dimension
+        result = processed_img * (1 - correction_mask) + corrected_img * correction_mask
+        
+        target_name = "inpainted" if correction_target == "correct_inpainted" else "non-inpainted"
+        print(f"[VAE-CC] Mask targeting: correcting {target_name} areas with {edge_feather}px feather")
+        return result
+    
+    def _auto_target_correction(self, original_img, processed_img, corrected_img, edge_feather, device, correction_target):
+        """Auto-detect inpainted areas and apply correction targeting."""
+        diff = torch.abs(original_img - processed_img)
+        diff_magnitude = torch.mean(diff, dim=-1)
+        
+        mean_diff = torch.mean(diff_magnitude)
+        std_diff = torch.std(diff_magnitude)
+        
+        # Use adaptive threshold
+        threshold = max(float(mean_diff + 0.5 * std_diff), 0.02)
+        
+        if mean_diff < 0.01:
+            print("[VAE-CC] Images very similar, applying full-image correction")
+            return corrected_img
+        
+        inpainted_mask = (diff_magnitude > threshold).float()
+        
+        if correction_target == "correct_inpainted":
+            correction_mask = inpainted_mask
+        elif correction_target == "correct_non_inpainted":
+            correction_mask = 1.0 - inpainted_mask
         else:
-            return strength
+            return corrected_img
+        
+        if edge_feather > 0:
+            correction_mask = self._feather_mask(correction_mask, edge_feather, device)
+        
+        correction_mask = correction_mask.unsqueeze(-1)
+        result = processed_img * (1 - correction_mask) + corrected_img * correction_mask
+        
+        inpainted_pct = torch.mean(inpainted_mask).item() * 100
+        print(f"[VAE-CC] Auto-detected {inpainted_pct:.1f}% as inpainted, targeting: {correction_target}")
+        return result
     
-    def _advanced_3d_lut_correction(self, original_np, processed_np, strength, vae_color_bias=None):
-        """Advanced 3D LUT-based color correction for precise VAE artifact fixing."""
+    def _feather_mask(self, mask, edge_feather, device):
+        """Apply Gaussian blur feathering to a mask."""
+        if ADVANCED_LIBS_AVAILABLE:
+            mask_np = mask.cpu().numpy()
+            ksize = min(edge_feather * 2 + 1, 99)
+            mask_np = cv2.GaussianBlur(mask_np, (ksize, ksize), edge_feather / 3)
+            return torch.from_numpy(mask_np).to(device)
+        else:
+            k = edge_feather
+            if k < 1:
+                return mask
+            mask_4d = mask.unsqueeze(0).unsqueeze(0)
+            blurred = F.avg_pool2d(mask_4d, kernel_size=k*2+1, stride=1, padding=k)
+            return blurred.squeeze(0).squeeze(0)
+    
+    # =========================================================================
+    # Fallback correction methods
+    # =========================================================================
+    def _advanced_3d_lut_correction(self, original_np, processed_np, strength):
+        """Advanced 3D LUT-based color correction."""
         if not ADVANCED_LIBS_AVAILABLE:
-            return match_to_reference_colors(processed_np, original_np, strength)
+            return self._statistical_matching_correction(original_np, processed_np, strength)
         
         try:
-            print("🔧 Building 3D color mapping...")
-            
-            # Create color mapping using k-means clustering
-            from sklearn.cluster import KMeans
-            
-            # Sample colors for mapping (use every 4th pixel for speed)
             orig_samples = original_np[::4, ::4].reshape(-1, 3)
             proc_samples = processed_np[::4, ::4].reshape(-1, 3)
             
-            # Use k-means to find representative color pairs
-            n_clusters = min(64, len(orig_samples) // 10)  # Adaptive cluster count
+            n_clusters = min(64, len(orig_samples) // 10)
+            if n_clusters < 4:
+                return self._statistical_matching_correction(original_np, processed_np, strength)
             
-            if n_clusters < 8:
-                # Too few samples, fall back to zone-based matching
-                return match_to_reference_colors(processed_np, original_np, strength)
-            
-            # Cluster processed colors
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             proc_clusters = kmeans.fit_predict(proc_samples)
             proc_centers = kmeans.cluster_centers_
             
-            # Find corresponding original colors for each cluster
             orig_centers = np.zeros_like(proc_centers)
             for i in range(n_clusters):
                 cluster_mask = proc_clusters == i
                 if np.sum(cluster_mask) > 0:
-                    # Average original colors that correspond to this processed cluster
                     orig_centers[i] = np.mean(orig_samples[cluster_mask], axis=0)
                 else:
-                    orig_centers[i] = proc_centers[i]  # Fallback
+                    orig_centers[i] = proc_centers[i]
             
-            # Apply color mapping to full image
-            corrected_np = processed_np.astype(np.float32)
-            
-            # For each pixel, find closest processed center and map to original center
             proc_flat = processed_np.reshape(-1, 3).astype(np.float32)
             
-            # Vectorized distance calculation
             distances = np.linalg.norm(
                 proc_flat[:, np.newaxis, :] - proc_centers[np.newaxis, :, :], axis=2
             )
             closest_clusters = np.argmin(distances, axis=1)
-            
-            # Apply color shifts with distance-based blending and VAE bias compensation
             min_distances = np.min(distances, axis=1)
-            max_distance = np.percentile(min_distances, 90)  # Use 90th percentile for normalization
+            max_distance = np.percentile(min_distances, 90) + 1e-6
             
             for i in range(n_clusters):
                 cluster_mask = closest_clusters == i
                 if np.sum(cluster_mask) > 0:
-                    # Calculate color shift for this cluster
                     color_shift = orig_centers[i] - proc_centers[i]
-                    
-                    # Apply VAE bias compensation if available
-                    if vae_color_bias is not None:
-                        # Determine luminance zone for this cluster
-                        cluster_luminance = np.mean(proc_centers[i])
-                        if cluster_luminance < 85:
-                            zone_bias = vae_color_bias.get("shadows", np.array([0.0, 0.0, 0.0]))
-                        elif cluster_luminance <= 170:
-                            zone_bias = vae_color_bias.get("midtones", np.array([0.0, 0.0, 0.0]))
-                        else:
-                            zone_bias = vae_color_bias.get("highlights", np.array([0.0, 0.0, 0.0]))
-                        
-                        # Add VAE bias compensation to color shift
-                        color_shift -= zone_bias * 0.5  # Gentle bias compensation
-                    
-                    # Apply with distance-based falloff and strength
                     cluster_distances = min_distances[cluster_mask]
                     distance_weights = np.clip(1.0 - cluster_distances / max_distance, 0.1, 1.0)
-                    
                     for c in range(3):
                         shift_amount = color_shift[c] * strength * distance_weights
-                        # Limit maximum shift to prevent extreme corrections
-                        shift_amount = np.clip(shift_amount, -50, 50)
                         proc_flat[cluster_mask, c] += shift_amount
             
-            # Reshape back and apply safe clamping
             corrected_np = proc_flat.reshape(processed_np.shape)
-            corrected_np = self._safe_clamp_colors(corrected_np, preserve_gradients=True)
-            
-            print(f"✅ 3D LUT correction applied using {n_clusters} color clusters")
-            return corrected_np
+            return np.clip(corrected_np, 0, 255).astype(np.uint8)
             
         except Exception as e:
-            print(f"❌ 3D LUT correction failed: {e}, falling back to zone matching")
-            return match_to_reference_colors(processed_np, original_np, strength)
+            print(f"[VAE-CC] 3D LUT correction failed: {e}")
+            return self._statistical_matching_correction(original_np, processed_np, strength)
     
-    def _histogram_matching_correction(self, original_np, processed_np, strength, vae_color_bias=None):
+    def _histogram_matching_correction(self, original_np, processed_np, strength):
         """Histogram-based color matching."""
         if not ADVANCED_LIBS_AVAILABLE:
-            return match_to_reference_colors(processed_np, original_np, strength)
+            return self._statistical_matching_correction(original_np, processed_np, strength)
         
         try:
             from skimage import exposure
-            
             corrected_np = processed_np.astype(np.float32)
             original_float = original_np.astype(np.float32)
             
-            # Match histogram for each channel
             for c in range(3):
                 matched_channel = exposure.match_histograms(
-                    corrected_np[:,:,c], original_float[:,:,c]
-                )
-                # Blend with original based on strength
+                    corrected_np[:,:,c].astype(np.uint8), original_float[:,:,c].astype(np.uint8)
+                ).astype(np.float32)
                 corrected_np[:,:,c] = (
                     processed_np[:,:,c] * (1 - strength) + 
                     matched_channel * strength
                 )
             
-            # Apply VAE bias compensation if available
-            if vae_color_bias is not None:
-                gray = np.mean(corrected_np, axis=2)
-                bias_strength = strength * 0.2  # Gentle bias correction for histogram method
-                
-                # Apply zone-specific bias corrections
-                shadows_mask = gray < 85
-                midtones_mask = (gray >= 85) & (gray <= 170)
-                highlights_mask = gray > 170
-                
-                for zone_name, mask in [("shadows", shadows_mask), ("midtones", midtones_mask), ("highlights", highlights_mask)]:
-                    if zone_name in vae_color_bias and np.sum(mask) > 0:
-                        bias = vae_color_bias[zone_name]
-                        for c in range(3):
-                            bias_correction = bias[c] * bias_strength
-                            # Limit bias correction to prevent extreme shifts
-                            bias_correction = np.clip(bias_correction, -30, 30)
-                            corrected_np[mask, c] -= bias_correction
-                            
-                print("✅ VAE bias compensation applied to histogram matching")
-            
-            return self._safe_clamp_colors(corrected_np, preserve_gradients=True)
+            return np.clip(corrected_np, 0, 255).astype(np.uint8)
             
         except Exception as e:
-            print(f"❌ Histogram matching failed: {e}")
-            return match_to_reference_colors(processed_np, original_np, strength)
+            print(f"[VAE-CC] Histogram matching failed: {e}")
+            return self._statistical_matching_correction(original_np, processed_np, strength)
     
-    def _statistical_matching_correction(self, original_np, processed_np, strength, vae_color_bias=None):
-        """Statistical moment matching (mean and std)."""
+    def _statistical_matching_correction(self, original_np, processed_np, strength):
+        """Statistical moment matching (mean and std). Works without ADVANCED_LIBS."""
         corrected_np = processed_np.astype(np.float32)
         original_float = original_np.astype(np.float32)
         
         for c in range(3):
-            # Calculate statistics
             proc_mean = np.mean(corrected_np[:,:,c])
             proc_std = np.std(corrected_np[:,:,c])
             orig_mean = np.mean(original_float[:,:,c])
             orig_std = np.std(original_float[:,:,c])
             
-            # Normalize and rescale
             if proc_std > 0:
                 normalized = (corrected_np[:,:,c] - proc_mean) / proc_std
                 rescaled = normalized * orig_std + orig_mean
-                
-                # Blend with strength
                 corrected_np[:,:,c] = (
                     corrected_np[:,:,c] * (1 - strength) + 
                     rescaled * strength
                 )
         
-        # Apply VAE bias compensation if available
-        if vae_color_bias is not None:
-            gray = np.mean(corrected_np, axis=2)
-            bias_strength = strength * 0.25  # Gentle bias correction for statistical method
-            
-            # Apply zone-specific bias corrections
-            shadows_mask = gray < 85
-            midtones_mask = (gray >= 85) & (gray <= 170)
-            highlights_mask = gray > 170
-            
-            for zone_name, mask in [("shadows", shadows_mask), ("midtones", midtones_mask), ("highlights", highlights_mask)]:
-                if zone_name in vae_color_bias and np.sum(mask) > 0:
-                    bias = vae_color_bias[zone_name]
-                    for c in range(3):
-                        bias_correction = bias[c] * bias_strength
-                        # Limit bias correction to prevent extreme shifts
-                        bias_correction = np.clip(bias_correction, -30, 30)
-                        corrected_np[mask, c] -= bias_correction
-                        
-            print("✅ VAE bias compensation applied to statistical matching")
-        
-        return self._safe_clamp_colors(corrected_np, preserve_gradients=True)
-    
-    def _apply_mask_preservation(self, processed_img, corrected_img, mask, edge_feather, device):
-        """Apply mask to preserve areas. White pixels in mask = preserve, black pixels = correct."""
-        # Mask convention: white (1.0) = preserve, black (0.0) = correct
-        # We need correction_mask where 1.0 = correct, 0.0 = preserve
-        correction_mask = 1.0 - mask.to(device)  # Invert: white becomes 0 (preserve), black becomes 1 (correct)
-        
-        if edge_feather > 0 and ADVANCED_LIBS_AVAILABLE:
-            # Apply gaussian blur for soft edges
-            correction_mask_np = correction_mask.cpu().numpy()
-            correction_mask_np = cv2.GaussianBlur(
-                correction_mask_np, (edge_feather*2+1, edge_feather*2+1), edge_feather/3
-            )
-            correction_mask = torch.from_numpy(correction_mask_np).to(device)
-        
-        # Apply mask: blend between processed and corrected
-        correction_mask = correction_mask.unsqueeze(-1)  # Add channel dimension
-        result = processed_img * (1 - correction_mask) + corrected_img * correction_mask
-        
-        print(f"✅ Mask-based preservation applied with {edge_feather}px feather")
-        return result
-    
-    def _auto_preserve_inpainted(self, original_img, processed_img, corrected_img, edge_feather, device):
-        """Auto-detect inpainted areas and preserve them."""
-        # Calculate difference between original and processed to find changed areas
-        diff = torch.abs(original_img - processed_img)
-        diff_magnitude = torch.mean(diff, dim=-1)  # Average across RGB
-        
-        # Threshold to find significantly changed areas (likely inpainted)
-        threshold = torch.quantile(diff_magnitude, 0.7)  # Top 30% of changes
-        inpainted_mask = (diff_magnitude > threshold).float()
-        
-        # Correction mask: 1 = correct, 0 = preserve
-        correction_mask = 1.0 - inpainted_mask
-        
-        if edge_feather > 0 and ADVANCED_LIBS_AVAILABLE:
-            # Smooth the mask
-            correction_mask_np = correction_mask.cpu().numpy()
-            correction_mask_np = cv2.GaussianBlur(
-                correction_mask_np, (edge_feather*2+1, edge_feather*2+1), edge_feather/3
-            )
-            correction_mask = torch.from_numpy(correction_mask_np).to(device)
-        
-        correction_mask = correction_mask.unsqueeze(-1)  # Add channel dimension
-        result = processed_img * (1 - correction_mask) + corrected_img * correction_mask
-        
-        preserved_pixels = torch.sum(1 - correction_mask).item()
-        print(f"✅ Auto-preserved {preserved_pixels:.0f} pixels (likely inpainted areas)")
-        return result
+        return np.clip(corrected_np, 0, 255).astype(np.uint8)
 
 
 # Export all classes
@@ -5343,3 +5501,4 @@ __all__ = [
     "FilmEmulation",
     "VAEColorCorrector",
 ]
+
