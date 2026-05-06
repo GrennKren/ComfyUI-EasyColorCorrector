@@ -2,6 +2,8 @@
 import typing
 import os
 
+print("[VAE-CC] === v1.7-seamless-boundary LOADED ===")
+
 # THIRD-PARTY IMPORTS
 import torch
 import torch.nn.functional as F
@@ -4790,12 +4792,15 @@ class VAEColorCorrector:
     """
     Specialized color correction for VAE artifacts in inpainting/img2img workflows.
     
-    v1.4-anime-inpaint-fix: Complete rewrite for anime/webtoon inpainting.
-    - Uses semantic skin-to-skin color transfer (NOT spatial correspondence)
-    - Samples reference skin from non-mask areas, applies to mask areas
-    - Supports anime/webtoon color ranges (cool/pastel/pink skin tones)
-    - New parameters: anime_mode, correction_target, skin_sample_region
-    - New method: anime_skin_match (the recommended method for inpainting)
+    v1.7-seamless-boundary: Seamless boundary blending for inpainting.
+    - Fixes visible seam at mask boundary by extending color correction
+      beyond the mask and applying Laplacian pyramid blending
+    - Boundary-paired color transfer: samples pixel pairs at mask edge
+      to compute accurate color shifts
+    - Laplacian pyramid blend: multi-scale blending eliminates hard edges
+    - cv2.seamlessClone with robust bounds checking
+    - Enhanced feather with border-aware color spill
+    - All previous functionality preserved
     """
     
     @classmethod
@@ -4856,6 +4861,23 @@ class VAEColorCorrector:
                         "tooltip": "Feather edges between corrected/preserved areas (pixels). Higher = smoother blend."
                     }
                 ),
+                "seamless_blend": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Enable seamless boundary blending to eliminate visible seams at mask edge. Uses Laplacian pyramid multi-scale blending."
+                    }
+                ),
+                "blend_method": (
+                    ["laplacian_pyramid", "poisson_clone", "feather_enhanced"],
+                    {
+                        "default": "laplacian_pyramid",
+                        "tooltip": "Seamless blending method:\n"
+                            "laplacian_pyramid: [RECOMMENDED] Multi-scale blending, smoothest result\n"
+                            "poisson_clone: OpenCV Poisson seamless clone (good for photos)\n"
+                            "feather_enhanced: Wide Gaussian feather with border color spill"
+                    }
+                ),
                 "skin_sample_region": (
                     "STRING",
                     {
@@ -4895,6 +4917,8 @@ class VAEColorCorrector:
         edge_feather=15,
         skin_sample_region="auto",
         lock_input_image=False,
+        seamless_blend=True,
+        blend_method="laplacian_pyramid",
     ):
         """Correct VAE-induced color shifts by referencing the original image."""
         device = original_image.device
@@ -4949,7 +4973,8 @@ class VAEColorCorrector:
             corrected_img = self._apply_vae_color_correction(
                 orig_img, proc_img, method, correction_strength, 
                 correction_target, current_mask, edge_feather, device,
-                anime_mode, skin_sample_region
+                anime_mode, skin_sample_region,
+                seamless_blend, blend_method
             )
             
             corrected_batch.append(corrected_img)
@@ -4962,9 +4987,10 @@ class VAEColorCorrector:
     def _apply_vae_color_correction(
         self, original_img, processed_img, method, strength, 
         correction_target, mask, edge_feather, device,
-        anime_mode, skin_sample_region
+        anime_mode, skin_sample_region,
+        seamless_blend=False, blend_method="laplacian_pyramid"
     ):
-        """Apply the actual color correction."""
+        """Apply the actual color correction with optional seamless boundary blending."""
         
         # Convert to numpy for processing
         orig_np = (original_img.cpu().numpy() * 255).astype(np.uint8)
@@ -4991,9 +5017,15 @@ class VAEColorCorrector:
         
         # Handle mask-based targeting
         if mask is not None:
-            corrected_tensor = self._apply_mask_targeting(
-                processed_img, corrected_tensor, mask, edge_feather, device, correction_target
-            )
+            if seamless_blend and correction_target == "correct_inpainted":
+                # Use seamless boundary blending instead of simple mask targeting
+                corrected_tensor = self._seamless_boundary_blend(
+                    processed_img, corrected_tensor, mask, edge_feather, device, blend_method
+                )
+            else:
+                corrected_tensor = self._apply_mask_targeting(
+                    processed_img, corrected_tensor, mask, edge_feather, device, correction_target
+                )
         elif correction_target != "full_image":
             # Auto-detect changed areas for targeting
             corrected_tensor = self._auto_target_correction(
@@ -5314,6 +5346,332 @@ class VAEColorCorrector:
         corrected[:, :, 2] += strength * 12  # Increase blue
         return np.clip(corrected, 0, 255).astype(np.uint8)
     
+    # =========================================================================
+    # SEAMLESS BOUNDARY BLENDING — eliminates visible seam at mask edge
+    # =========================================================================
+    def _seamless_boundary_blend(self, processed_img, corrected_img, mask, edge_feather, device, blend_method):
+        """
+        Seamless boundary blending for inpainting correction.
+        
+        Problem: After color correction, there's a visible seam at the mask
+        boundary because corrected pixels (inside mask) and uncorrected pixels
+        (outside mask) have different color characteristics.
+        
+        Solution: Instead of a hard mask cutoff, we:
+        1. Compute the color difference at the mask boundary
+        2. Apply a gradient color spill that extends correction BEYOND the mask
+        3. Blend using the selected method (Laplacian pyramid / Poisson / feather)
+        
+        Args:
+            processed_img: Original processed image tensor (H, W, 3) float [0,1]
+            corrected_img: Color-corrected image tensor (H, W, 3) float [0,1]
+            mask: Binary mask tensor (H, W) float, 1=inpainted, 0=original
+            edge_feather: Feather width in pixels
+            device: torch device
+            blend_method: "laplacian_pyramid", "poisson_clone", or "feather_enhanced"
+        """
+        print(f"[VAE-CC] Seamless boundary blending: method={blend_method}, feather={edge_feather}px")
+        
+        mask_float = mask.to(device).float()
+        
+        # Dilate the mask slightly so color correction extends beyond the boundary
+        # This prevents the hard edge where correction suddenly stops
+        if ADVANCED_LIBS_AVAILABLE:
+            mask_np = mask_float.cpu().numpy()
+            # Dilate by edge_feather pixels to create transition zone
+            dilate_px = max(edge_feather, 10)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+            dilated_mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+            dilated_mask = torch.from_numpy(dilated_mask_np).to(device).float()
+        else:
+            dilated_mask = mask_float
+        
+        # Step 1: Compute boundary color spill
+        # At the mask boundary, compute the average color difference between
+        # corrected and processed pixels, then apply that shift as a gradient
+        # extending outward from the mask
+        corrected_np = corrected_img.cpu().numpy()
+        processed_np = processed_img.cpu().numpy()
+        mask_np_for_spill = mask_float.cpu().numpy()
+        
+        # Find boundary pixels (mask pixels adjacent to non-mask pixels)
+        if ADVANCED_LIBS_AVAILABLE:
+            # Erode mask to find interior, boundary = mask - eroded
+            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            eroded = cv2.erode(mask_np_for_spill, erode_kernel, iterations=1)
+            boundary_mask = ((mask_np_for_spill > 0.5) & (eroded < 0.5))
+        else:
+            boundary_mask = (mask_np_for_spill > 0.5)
+        
+        if np.sum(boundary_mask) > 10:
+            # Compute average color shift at the boundary
+            boundary_shift = np.mean(
+                corrected_np[boundary_mask] - processed_np[boundary_mask], axis=0
+            )
+            print(f"[VAE-CC] Boundary color shift: R={boundary_shift[0]:.4f}, G={boundary_shift[1]:.4f}, B={boundary_shift[2]:.4f}")
+            
+            # Apply gradient spill: the shift decreases with distance from mask
+            # Using distance transform for smooth falloff
+            if ADVANCED_LIBS_AVAILABLE:
+                # Distance from mask boundary (outside the mask)
+                inv_mask = (mask_np_for_spill < 0.5).astype(np.uint8)
+                dist_from_mask = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
+                
+                # Create gradient: 1.0 at boundary, fading to 0 over edge_feather*2 pixels
+                spill_radius = max(edge_feather * 2, 20)
+                spill_strength = np.clip(1.0 - dist_from_mask / max(spill_radius, 1), 0, 1)
+                # Only apply outside the mask
+                spill_strength = spill_strength * (1.0 - mask_np_for_spill)
+                
+                # Apply color spill to processed image
+                spilled_np = processed_np.copy()
+                for c in range(3):
+                    spilled_np[:, :, c] += boundary_shift[c] * spill_strength * 0.7
+                
+                spilled_np = np.clip(spilled_np, 0, 1)
+                spilled_tensor = torch.from_numpy(spilled_np).to(device)
+            else:
+                spilled_tensor = processed_img
+        else:
+            spilled_tensor = processed_img
+        
+        # Step 2: Apply the selected blending method
+        if blend_method == "laplacian_pyramid" and ADVANCED_LIBS_AVAILABLE:
+            result = self._laplacian_pyramid_blend(
+                spilled_tensor, corrected_img, dilated_mask, device
+            )
+        elif blend_method == "poisson_clone" and ADVANCED_LIBS_AVAILABLE:
+            result = self._poisson_seamless_clone(
+                spilled_tensor, corrected_img, mask_float, device
+            )
+        elif blend_method == "feather_enhanced":
+            result = self._enhanced_feather_blend(
+                spilled_tensor, corrected_img, dilated_mask, edge_feather, device
+            )
+        else:
+            # Fallback to standard feather blend
+            if edge_feather > 0:
+                blend_mask = self._feather_mask(dilated_mask, edge_feather, device)
+            else:
+                blend_mask = dilated_mask
+            blend_mask = blend_mask.unsqueeze(-1)
+            result = spilled_tensor * (1 - blend_mask) + corrected_img * blend_mask
+        
+        print(f"[VAE-CC] Seamless boundary blending complete")
+        return result
+    
+    def _laplacian_pyramid_blend(self, img_a, img_b, mask, device, levels=4):
+        """
+        Laplacian pyramid blending - the gold standard for seamless image blending.
+        
+        Builds Laplacian pyramids for both images, a Gaussian pyramid for the mask,
+        then blends at each frequency level independently. This produces the smoothest
+        possible transition without visible seams at any scale.
+        
+        Args:
+            img_a: Tensor (H, W, 3) - image for mask=0 region (outside)
+            img_b: Tensor (H, W, 3) - image for mask=1 region (inside/corrected)
+            mask: Tensor (H, W) - blend mask
+            device: torch device
+            levels: number of pyramid levels
+        """
+        try:
+            # Convert to numpy float32 for OpenCV pyramid operations
+            a_np = img_a.cpu().numpy().astype(np.float32)
+            b_np = img_b.cpu().numpy().astype(np.float32)
+            mask_np = mask.cpu().numpy().astype(np.float32)
+            
+            # Ensure minimum dimensions for pyramid levels
+            h, w = a_np.shape[:2]
+            min_dim = min(h, w)
+            levels = min(levels, int(np.log2(min_dim)) - 1)
+            levels = max(levels, 1)
+            
+            # Build Gaussian pyramid for mask
+            gp_mask = [mask_np]
+            for i in range(levels):
+                mask_np = cv2.pyrDown(mask_np)
+                # Ensure mask stays 2D
+                if mask_np.ndim == 3:
+                    mask_np = mask_np[:, :, 0]
+                gp_mask.append(mask_np)
+            
+            # Build Laplacian pyramids for both images
+            def build_laplacian_pyramid(img):
+                gp = [img]
+                for i in range(levels):
+                    img = cv2.pyrDown(img)
+                    gp.append(img)
+                lp = [gp[-1]]  # Smallest level
+                for i in range(levels, 0, -1):
+                    up = cv2.pyrUp(gp[i], dstsize=(gp[i-1].shape[1], gp[i-1].shape[0]))
+                    lp.append(gp[i-1] - up)
+                return lp
+            
+            lp_a = build_laplacian_pyramid(a_np)
+            lp_b = build_laplacian_pyramid(b_np)
+            
+            # Blend at each level
+            blended_lp = []
+            for i in range(len(lp_a)):
+                # Resize mask to match this level
+                level_mask = gp_mask[min(i, len(gp_mask)-1)]
+                if level_mask.shape[:2] != lp_a[i].shape[:2]:
+                    level_mask = cv2.resize(level_mask, (lp_a[i].shape[1], lp_a[i].shape[0]))
+                level_mask_3ch = level_mask[:, :, np.newaxis]
+                
+                # Blend: mask * B + (1-mask) * A at each frequency band
+                blended = lp_a[i] * (1.0 - level_mask_3ch) + lp_b[i] * level_mask_3ch
+                blended_lp.append(blended)
+            
+            # Reconstruct from blended Laplacian pyramid
+            result = blended_lp[0]  # Smallest level (the residual)
+            for i in range(1, len(blended_lp)):
+                result = cv2.pyrUp(result, dstsize=(blended_lp[i].shape[1], blended_lp[i].shape[0]))
+                result += blended_lp[i]
+            
+            result = np.clip(result, 0, 1)
+            return torch.from_numpy(result).to(device)
+            
+        except Exception as e:
+            print(f"[VAE-CC] Laplacian pyramid blend failed: {e}, falling back to feather blend")
+            import traceback
+            traceback.print_exc()
+            # Fallback to enhanced feather
+            return self._enhanced_feather_blend(img_a, img_b, mask, 20, device)
+    
+    def _poisson_seamless_clone(self, img_a, img_b, mask, device):
+        """
+        OpenCV Poisson seamless clone with robust bounds checking.
+        
+        cv2.seamlessClone often crashes with "assertion failed" if the
+        center point or ROI doesn't fit within image bounds. This implementation
+        carefully clips all values to valid ranges.
+        
+        Args:
+            img_a: Tensor (H, W, 3) - destination (background) image
+            img_b: Tensor (H, W, 3) - source (foreground/corrected) image
+            mask: Tensor (H, W) - binary mask
+            device: torch device
+        """
+        try:
+            dst = (img_a.cpu().numpy() * 255).astype(np.uint8)
+            src = (img_b.cpu().numpy() * 255).astype(np.uint8)
+            mask_np = (mask.cpu().numpy() * 255).astype(np.uint8)
+            
+            h, w = dst.shape[:2]
+            
+            # Find bounding box of mask
+            coords = cv2.findNonZero(mask_np)
+            if coords is None:
+                print("[VAE-CC] Poisson: no mask pixels found, returning original")
+                return img_a
+            
+            x, y, bw, bh = cv2.boundingRect(coords)
+            
+            # Add padding and clamp to image bounds
+            pad = 5
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w, x + bw + pad)
+            y2 = min(h, y + bh + pad)
+            
+            # Crop to ROI
+            src_roi = src[y1:y2, x1:x2].copy()
+            dst_roi = dst[y1:y2, x1:x2].copy()
+            mask_roi = mask_np[y1:y2, x1:x2].copy()
+            
+            # Center must be inside the ROI with at least 1px margin
+            roi_h, roi_w = src_roi.shape[:2]
+            center_x = roi_w // 2
+            center_y = roi_h // 2
+            
+            # Ensure center is within bounds (cv2 requires 0 < center < size)
+            center_x = max(1, min(center_x, roi_w - 2))
+            center_y = max(1, min(center_y, roi_h - 2))
+            
+            # Ensure mask has non-zero pixels for seamlessClone
+            if np.sum(mask_roi) == 0:
+                print("[VAE-CC] Poisson: empty mask ROI, returning original")
+                return img_a
+            
+            # Ensure mask ROI is at least 3x3
+            if roi_h < 3 or roi_w < 3:
+                print("[VAE-CC] Poisson: ROI too small, falling back to feather")
+                return self._enhanced_feather_blend(img_a, img_b, mask, 20, device)
+            
+            # Perform seamless clone with MIXED_CLONE (preserves texture)
+            result_roi = cv2.seamlessClone(
+                src_roi, dst_roi, mask_roi, (center_x, center_y), cv2.MIXED_CLONE
+            )
+            
+            # Place result back into full image
+            result = dst.copy()
+            result[y1:y2, x1:x2] = result_roi
+            
+            result_float = result.astype(np.float32) / 255.0
+            return torch.from_numpy(result_float).to(device)
+            
+        except Exception as e:
+            print(f"[VAE-CC] Poisson seamless clone failed: {e}, falling back to feather blend")
+            import traceback
+            traceback.print_exc()
+            return self._enhanced_feather_blend(img_a, img_b, mask, 20, device)
+    
+    def _enhanced_feather_blend(self, img_a, img_b, mask, feather_px, device):
+        """
+        Enhanced feather blend with wide Gaussian kernel and iterative blur.
+        
+        Better than simple single-pass Gaussian because:
+        - Uses multiple blur passes for smoother falloff
+        - Ensures mask reaches exactly 0 and 1 at the right places
+        - Works for both realistic and anime images
+        
+        Args:
+            img_a: Tensor (H, W, 3) - outside image
+            img_b: Tensor (H, W, 3) - inside/corrected image
+            mask: Tensor (H, W) - blend mask
+            feather_px: feather width
+            device: torch device
+        """
+        mask_np = mask.cpu().numpy().astype(np.float32)
+        a_np = img_a.cpu().numpy().astype(np.float32)
+        b_np = img_b.cpu().numpy().astype(np.float32)
+        
+        # Create a smooth transition mask
+        # Start from the binary mask
+        binary_mask = (mask_np > 0.5).astype(np.float32)
+        
+        # Apply multiple Gaussian blur passes for extra-smooth falloff
+        blur_radius = max(feather_px, 15)
+        ksize = min(blur_radius * 2 + 1, 99)
+        
+        if ADVANCED_LIBS_AVAILABLE:
+            # First pass: wide blur
+            smooth_mask = cv2.GaussianBlur(binary_mask, (ksize, ksize), blur_radius / 2.5)
+            # Second pass: refine edges
+            smooth_mask = cv2.GaussianBlur(smooth_mask, (ksize, ksize), blur_radius / 4)
+            # Ensure values stay in [0, 1]
+            smooth_mask = np.clip(smooth_mask, 0, 1)
+            # Re-normalize so it actually reaches 0 and 1
+            min_val = smooth_mask.min()
+            max_val = smooth_mask.max()
+            if max_val > min_val:
+                smooth_mask = (smooth_mask - min_val) / (max_val - min_val)
+        else:
+            # Fallback using torch
+            mask_t = torch.from_numpy(binary_mask).unsqueeze(0).unsqueeze(0).to(device)
+            k = blur_radius
+            blurred = F.avg_pool2d(mask_t, kernel_size=k*2+1, stride=1, padding=k)
+            smooth_mask = blurred.squeeze(0).squeeze(0).cpu().numpy()
+        
+        # Blend using the smooth mask
+        smooth_mask_3ch = smooth_mask[:, :, np.newaxis]
+        result = a_np * (1.0 - smooth_mask_3ch) + b_np * smooth_mask_3ch
+        result = np.clip(result, 0, 1)
+        
+        return torch.from_numpy(result).to(device)
+
     # =========================================================================
     # Mask targeting — controls which areas get the correction applied
     # =========================================================================
