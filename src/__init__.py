@@ -2,7 +2,7 @@
 import typing
 import os
 
-print("[VAE-CC] === v1.7.1-seamless-boundary-fix LOADED ===")
+print("[VAE-CC] === v1.3.1-anime-fix LOADED ===")
 
 # THIRD-PARTY IMPORTS
 import torch
@@ -5053,17 +5053,20 @@ class VAEColorCorrector:
         2. Find skin-like colors in MASK areas of the PROCESSED image (target)
         3. Compute per-luminance-zone color shift from target to reference in LAB space
         4. Apply shift to mask area only, with strength blending
+        
+        v1.3.1-fix: Fixed fallback when ADVANCED_LIBS not available — now uses
+        original_np as reference instead of processed_np (which was a no-op).
         """
         if ADVANCED_LIBS_AVAILABLE:
-            return self._anime_skin_match_advanced(processed_np, strength, anime_mode, mask, skin_sample_region)
+            return self._anime_skin_match_advanced(original_np, processed_np, strength, anime_mode, mask, skin_sample_region)
         else:
-            print("[VAE-CC] Advanced libs not available, using statistical fallback")
-            corrected = self._statistical_matching_correction(processed_np, processed_np, strength)
+            print("[VAE-CC] Advanced libs not available, using statistical fallback with original reference")
+            corrected = self._statistical_matching_correction(original_np, processed_np, strength)
             if anime_mode:
                 corrected = self._apply_anime_cool_bias(corrected, strength * 0.3)
             return corrected
     
-    def _anime_skin_match_advanced(self, processed_np, strength, anime_mode, mask, skin_sample_region):
+    def _anime_skin_match_advanced(self, original_np, processed_np, strength, anime_mode, mask, skin_sample_region):
         """
         Advanced anime skin match using OpenCV LAB color space.
         
@@ -5114,8 +5117,8 @@ class VAEColorCorrector:
                 sample_lab = proc_lab[non_inpainted_mask]
             
             if len(sample_lab) < 50:
-                print("[VAE-CC] Insufficient reference pixels, falling back to statistical matching")
-                return self._statistical_matching_correction(processed_np, processed_np, strength)
+                print("[VAE-CC] Insufficient reference pixels, falling back to statistical matching with original reference")
+                return self._statistical_matching_correction(original_np, processed_np, strength)
             
             # ----------------------------------------------------------------
             # STEP 2: Identify SKIN pixels in the reference (non-mask) area
@@ -5194,7 +5197,8 @@ class VAEColorCorrector:
                 """Cluster LAB data into luminance zones and return zone stats."""
                 if len(lab_data) < n_zones * 10:
                     # Not enough data for clustering, use single zone
-                    return [(np.mean(lab_data, axis=0), np.mean(lab_data, axis=0))]
+                    # v1.3.1-fix: Return (mean, std) not (mean, mean)
+                    return [(np.mean(lab_data, axis=0), np.std(lab_data, axis=0))]
                 
                 lum = lab_data[:, 0]
                 # Create luminance zones using quantiles
@@ -5337,7 +5341,8 @@ class VAEColorCorrector:
             print(f"[VAE-CC] Anime skin match failed: {e}, falling back to statistical matching")
             import traceback
             traceback.print_exc()
-            return self._statistical_matching_correction(processed_np, processed_np, strength)
+            # v1.3.1-fix: Use original_np as reference for meaningful fallback
+            return self._statistical_matching_correction(original_np, processed_np, strength)
     
     def _apply_anime_cool_bias(self, image_np, strength):
         """Apply a subtle cool/blue bias to counteract VAE warm shift in anime images."""

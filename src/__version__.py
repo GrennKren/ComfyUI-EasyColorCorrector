@@ -1,1 +1,1 @@
-__version__ = "1.3.0-anime-fix"
+__version__ = "1.3.1-anime-fix"
