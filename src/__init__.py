@@ -2,7 +2,7 @@
 import typing
 import os
 
-print("[VAE-CC] === v1.7-seamless-boundary LOADED ===")
+print("[VAE-CC] === v1.7.1-seamless-boundary-fix LOADED ===")
 
 # THIRD-PARTY IMPORTS
 import torch
@@ -5374,71 +5374,91 @@ class VAEColorCorrector:
         
         mask_float = mask.to(device).float()
         
-        # Dilate the mask slightly so color correction extends beyond the boundary
-        # This prevents the hard edge where correction suddenly stops
+        # Create a smooth blend mask from the original mask
+        # Instead of harsh dilation + spill, use Gaussian blur on the mask
+        # to create a naturally smooth transition zone
         if ADVANCED_LIBS_AVAILABLE:
             mask_np = mask_float.cpu().numpy()
-            # Dilate by edge_feather pixels to create transition zone
-            dilate_px = max(edge_feather, 10)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
-            dilated_mask_np = cv2.dilate(mask_np, kernel, iterations=1)
-            dilated_mask = torch.from_numpy(dilated_mask_np).to(device).float()
-        else:
-            dilated_mask = mask_float
-        
-        # Step 1: Compute boundary color spill
-        # At the mask boundary, compute the average color difference between
-        # corrected and processed pixels, then apply that shift as a gradient
-        # extending outward from the mask
-        corrected_np = corrected_img.cpu().numpy()
-        processed_np = processed_img.cpu().numpy()
-        mask_np_for_spill = mask_float.cpu().numpy()
-        
-        # Find boundary pixels (mask pixels adjacent to non-mask pixels)
-        if ADVANCED_LIBS_AVAILABLE:
-            # Erode mask to find interior, boundary = mask - eroded
-            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            eroded = cv2.erode(mask_np_for_spill, erode_kernel, iterations=1)
-            boundary_mask = ((mask_np_for_spill > 0.5) & (eroded < 0.5))
-        else:
-            boundary_mask = (mask_np_for_spill > 0.5)
-        
-        if np.sum(boundary_mask) > 10:
-            # Compute average color shift at the boundary
-            boundary_shift = np.mean(
-                corrected_np[boundary_mask] - processed_np[boundary_mask], axis=0
-            )
-            print(f"[VAE-CC] Boundary color shift: R={boundary_shift[0]:.4f}, G={boundary_shift[1]:.4f}, B={boundary_shift[2]:.4f}")
             
-            # Apply gradient spill: the shift decreases with distance from mask
-            # Using distance transform for smooth falloff
-            if ADVANCED_LIBS_AVAILABLE:
-                # Distance from mask boundary (outside the mask)
-                inv_mask = (mask_np_for_spill < 0.5).astype(np.uint8)
-                dist_from_mask = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
+            # Create a smooth gradient mask using distance transform
+            # This gives a perfectly smooth falloff from 1 (inside mask) to 0 (outside)
+            binary_mask = (mask_np > 0.5).astype(np.uint8)
+            
+            # Distance inside mask from boundary
+            dist_inside = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
+            # Distance outside mask from boundary  
+            dist_outside = cv2.distanceTransform(1 - binary_mask, cv2.DIST_L2, 5)
+            
+            # Feather radius: how many pixels for the transition zone
+            feather_radius = max(edge_feather * 2, 20)
+            
+            # Create smooth mask: 1.0 deep inside mask, smooth falloff at boundary, 0.0 outside
+            smooth_mask = np.zeros_like(mask_np, dtype=np.float32)
+            
+            # Inside mask: 1.0 in the interior, gradient near boundary
+            inside_falloff = np.clip(dist_inside / max(feather_radius, 1), 0, 1)
+            # Outside mask: small gradient extending outward
+            outside_falloff = 1.0 - np.clip(dist_outside / max(feather_radius * 0.5, 1), 0, 1)
+            
+            smooth_mask = np.where(binary_mask > 0, inside_falloff, outside_falloff * 0.3)
+            
+            # Apply Gaussian blur for extra smoothness
+            blur_ksize = min(feather_radius * 2 + 1, 99)
+            if blur_ksize % 2 == 0:
+                blur_ksize += 1
+            smooth_mask = cv2.GaussianBlur(smooth_mask, (blur_ksize, blur_ksize), feather_radius / 3.0)
+            smooth_mask = np.clip(smooth_mask, 0, 1)
+            
+            # Re-normalize so inside mask is close to 1.0 and outside is close to 0.0
+            # but preserve the smooth gradient at boundary
+            max_interior = np.max(smooth_mask * binary_mask)
+            if max_interior > 0:
+                # Scale so interior values approach 1.0
+                smooth_mask = np.clip(smooth_mask / max(max_interior, 0.5), 0, 1)
+            
+            smooth_mask_tensor = torch.from_numpy(smooth_mask).to(device).float()
+            
+            # Compute boundary color spill (gentler version)
+            corrected_np = corrected_img.cpu().numpy()
+            processed_np = processed_img.cpu().numpy()
+            
+            # Find boundary ring (3px wide ring inside mask at the edge)
+            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            eroded = cv2.erode(binary_mask, erode_kernel, iterations=1)
+            boundary_ring = ((binary_mask > 0) & (eroded == 0))
+            
+            if np.sum(boundary_ring) > 10:
+                # Average color shift at the boundary
+                boundary_shift = np.mean(
+                    corrected_np[boundary_ring] - processed_np[boundary_ring], axis=0
+                )
+                print(f"[VAE-CC] Boundary color shift: R={boundary_shift[0]:.4f}, G={boundary_shift[1]:.4f}, B={boundary_shift[2]:.4f}")
                 
-                # Create gradient: 1.0 at boundary, fading to 0 over edge_feather*2 pixels
-                spill_radius = max(edge_feather * 2, 20)
-                spill_strength = np.clip(1.0 - dist_from_mask / max(spill_radius, 1), 0, 1)
-                # Only apply outside the mask
-                spill_strength = spill_strength * (1.0 - mask_np_for_spill)
+                # Apply VERY gentle gradient spill outside the mask
+                # This helps the Laplacian pyramid blend by making the transition even smoother
+                spill_radius = max(edge_feather * 3, 30)
+                spill_falloff = np.clip(1.0 - dist_outside / max(spill_radius, 1), 0, 1)
+                spill_falloff = spill_falloff * (1.0 - binary_mask.astype(np.float32))
+                # Gentle Gaussian on spill too
+                spill_falloff = cv2.GaussianBlur(spill_falloff, (blur_ksize, blur_ksize), spill_radius / 4.0)
                 
-                # Apply color spill to processed image
                 spilled_np = processed_np.copy()
                 for c in range(3):
-                    spilled_np[:, :, c] += boundary_shift[c] * spill_strength * 0.7
+                    spilled_np[:, :, c] += boundary_shift[c] * spill_falloff * 0.4
                 
                 spilled_np = np.clip(spilled_np, 0, 1)
                 spilled_tensor = torch.from_numpy(spilled_np).to(device)
             else:
                 spilled_tensor = processed_img
         else:
+            # Fallback without OpenCV
+            smooth_mask_tensor = mask_float
             spilled_tensor = processed_img
         
         # Step 2: Apply the selected blending method
         if blend_method == "laplacian_pyramid" and ADVANCED_LIBS_AVAILABLE:
             result = self._laplacian_pyramid_blend(
-                spilled_tensor, corrected_img, dilated_mask, device
+                spilled_tensor, corrected_img, smooth_mask_tensor, device
             )
         elif blend_method == "poisson_clone" and ADVANCED_LIBS_AVAILABLE:
             result = self._poisson_seamless_clone(
@@ -5446,14 +5466,14 @@ class VAEColorCorrector:
             )
         elif blend_method == "feather_enhanced":
             result = self._enhanced_feather_blend(
-                spilled_tensor, corrected_img, dilated_mask, edge_feather, device
+                spilled_tensor, corrected_img, smooth_mask_tensor, edge_feather, device
             )
         else:
             # Fallback to standard feather blend
             if edge_feather > 0:
-                blend_mask = self._feather_mask(dilated_mask, edge_feather, device)
+                blend_mask = self._feather_mask(smooth_mask_tensor, edge_feather, device)
             else:
-                blend_mask = dilated_mask
+                blend_mask = smooth_mask_tensor
             blend_mask = blend_mask.unsqueeze(-1)
             result = spilled_tensor * (1 - blend_mask) + corrected_img * blend_mask
         
@@ -5467,6 +5487,10 @@ class VAEColorCorrector:
         Builds Laplacian pyramids for both images, a Gaussian pyramid for the mask,
         then blends at each frequency level independently. This produces the smoothest
         possible transition without visible seams at any scale.
+        
+        v1.7.1-fix: Fixed critical bug where Laplacian levels and Gaussian mask levels
+        were mismatched (coarsest LP level was paired with finest mask level, causing
+        boundary noise artifacts).
         
         Args:
             img_a: Tensor (H, W, 3) - image for mask=0 region (outside)
@@ -5487,35 +5511,43 @@ class VAEColorCorrector:
             levels = min(levels, int(np.log2(min_dim)) - 1)
             levels = max(levels, 1)
             
-            # Build Gaussian pyramid for mask
+            # Build Gaussian pyramids for all three (A, B, mask)
+            # gp[0] = original size, gp[levels] = smallest
+            gp_a = [a_np]
+            gp_b = [b_np]
             gp_mask = [mask_np]
             for i in range(levels):
-                mask_np = cv2.pyrDown(mask_np)
-                # Ensure mask stays 2D
-                if mask_np.ndim == 3:
-                    mask_np = mask_np[:, :, 0]
-                gp_mask.append(mask_np)
+                gp_a.append(cv2.pyrDown(gp_a[-1]))
+                gp_b.append(cv2.pyrDown(gp_b[-1]))
+                m = cv2.pyrDown(gp_mask[-1])
+                # Ensure mask stays 2D after pyrDown
+                if m.ndim == 3:
+                    m = m[:, :, 0]
+                gp_mask.append(m)
             
-            # Build Laplacian pyramids for both images
-            def build_laplacian_pyramid(img):
-                gp = [img]
-                for i in range(levels):
-                    img = cv2.pyrDown(img)
-                    gp.append(img)
-                lp = [gp[-1]]  # Smallest level
-                for i in range(levels, 0, -1):
-                    up = cv2.pyrUp(gp[i], dstsize=(gp[i-1].shape[1], gp[i-1].shape[0]))
-                    lp.append(gp[i-1] - up)
-                return lp
+            # Build Laplacian pyramids from Gaussian pyramids
+            # Laplacian[i] = Gaussian[i] - pyrUp(Gaussian[i+1])
+            # Store from FINEST (level 0 = original) to COARSEST (level levels = smallest)
+            lp_a = []
+            lp_b = []
+            for i in range(levels):
+                up_a = cv2.pyrUp(gp_a[i+1], dstsize=(gp_a[i].shape[1], gp_a[i].shape[0]))
+                up_b = cv2.pyrUp(gp_b[i+1], dstsize=(gp_b[i].shape[1], gp_b[i].shape[0]))
+                lp_a.append(gp_a[i] - up_a)
+                lp_b.append(gp_b[i] - up_b)
+            # The coarsest level is the last Gaussian level (the residual)
+            lp_a.append(gp_a[levels])
+            lp_b.append(gp_b[levels])
+            # Now lp_a[0] = finest detail, lp_a[levels] = coarsest (residual)
+            # And gp_mask[0] = finest, gp_mask[levels] = coarsest
+            # PERFECT MATCH: lp_a[i] pairs with gp_mask[i] for all i
             
-            lp_a = build_laplacian_pyramid(a_np)
-            lp_b = build_laplacian_pyramid(b_np)
-            
-            # Blend at each level
+            # Blend at each level using corresponding mask level
             blended_lp = []
             for i in range(len(lp_a)):
-                # Resize mask to match this level
-                level_mask = gp_mask[min(i, len(gp_mask)-1)]
+                # Get the correctly-matched mask level
+                level_mask = gp_mask[i]
+                # Resize if dimensions don't match (safety check)
                 if level_mask.shape[:2] != lp_a[i].shape[:2]:
                     level_mask = cv2.resize(level_mask, (lp_a[i].shape[1], lp_a[i].shape[0]))
                 level_mask_3ch = level_mask[:, :, np.newaxis]
@@ -5525,8 +5557,9 @@ class VAEColorCorrector:
                 blended_lp.append(blended)
             
             # Reconstruct from blended Laplacian pyramid
-            result = blended_lp[0]  # Smallest level (the residual)
-            for i in range(1, len(blended_lp)):
+            # Start from coarsest level and work up
+            result = blended_lp[-1]  # Coarsest level (the residual)
+            for i in range(len(blended_lp) - 2, -1, -1):
                 result = cv2.pyrUp(result, dstsize=(blended_lp[i].shape[1], blended_lp[i].shape[0]))
                 result += blended_lp[i]
             
